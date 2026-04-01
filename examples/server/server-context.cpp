@@ -377,6 +377,7 @@ void server_slot::reset() {
     rewind_status = false;
 
     generated_token_probs.clear();
+    prompt_token_probs.clear();
     checkpoint_pos = 0;
     image_just_processed = false;
     do_checkpoint = false;
@@ -907,6 +908,7 @@ bool server_context::launch_slot_with_task(server_slot& slot, server_task& task)
     slot.sparams.min_keep = json_value(data, "min_keep", default_sparams.min_keep);
 
     slot.params.post_sampling_probs = json_value(data, "post_sampling_probs", defaults.post_sampling_probs);
+    slot.params.prompt_logprobs     = json_value(data, "prompt_logprobs",     defaults.prompt_logprobs);
 
     // speculative decoding parameters
     slot.params.speculative.n_max = json_value(data, "speculative.n_max", params_base.speculative.n_max);
@@ -1703,7 +1705,9 @@ json server_context::get_formated_generation(const server_slot& slot) const {
         {"reasoning_format",          common_reasoning_format_name(slot.params.oaicompat_chat_syntax.reasoning_format)},
         {"reasoning_in_content",      slot.params.oaicompat_chat_syntax.reasoning_in_content},
         {"thinking_forced_open",      slot.params.oaicompat_chat_syntax.thinking_forced_open},
-        {"samplers",                  samplers_sequence}
+        {"samplers",                  samplers_sequence},
+        {"post_sampling_probs",       slot.params.post_sampling_probs},
+        {"prompt_logprobs",           slot.params.prompt_logprobs}
     };
 }
 
@@ -1858,7 +1862,6 @@ void server_context::send_final_response(server_slot& slot) {
         {"stopping_word",       slot.stopping_word},
         {"tokens_cached",       slot.n_past},
         {"timings",             slot.get_formated_timings()},
-        //{"oaicompat_chat_format",  slot.params.oaicompat_chat_format},
     };
 
     // populate res->probs_output
@@ -1867,6 +1870,10 @@ void server_context::send_final_response(server_slot& slot) {
             slot.generated_token_probs.begin(),
             slot.generated_token_probs.end());
         res->data["completion_probabilities"] = probs_vector_to_json(ctx, res->probs_output);
+    }
+
+    if (slot.params.prompt_logprobs && !slot.prompt_token_probs.empty()) {
+        res->data["prompt_probabilities"] = completion_token_output::probs_vector_to_json(slot.prompt_token_probs, false);
     }
 
     if (slot.oaicompat) {
@@ -3200,6 +3207,10 @@ void server_context::batch_pending_prompt(const int32_t n_ubatch, const int32_t 
 
                     slot.cache_tokens.push_back(cur_tok);
 
+                    // enable logits for all prompt tokens when prompt_logprobs is requested
+                    if (slot.params.prompt_logprobs && slot.sparams.n_probs > 0) {
+                        batch.logits[batch.n_tokens - 1] = true;
+                    }
 
                     slot.n_prompt_tokens_processed++;
                     slot_npast++;
@@ -3716,6 +3727,40 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
                     batch_mtp_hidden_state.resize(n_toks * n_embd);
                     memcpy(batch_mtp_hidden_state.data(), emb, n_toks * n_embd * sizeof(float));
                 }
+            }
+        }
+
+        // collect prompt token logprobs from the batch we just decoded
+        // logits at position j predict the token at position j+1 (autoregressive),
+        // so we record the next prompt token with probabilities from position j.
+        for (auto & slot : slots) {
+            if (!slot.params.prompt_logprobs || slot.sparams.n_probs == 0) {
+                continue;
+            }
+            if (!slot.params.prompt_logprobs || slot.sparams.n_probs == 0) {
+                continue;
+            }
+            if (slot.command != SLOT_COMMAND_LOAD_PROMPT && !(slot.state == SLOT_STATE_PROCESSING && slot.command == SLOT_COMMAND_NONE)) {
+                continue;
+            }
+
+            for (int j = 0; j < n_tokens; j++) {
+                if (!batch_view.logits[j] || batch_view.seq_id[j][0] != slot.id) {
+                    continue;
+                }
+
+                // find the next prompt token (the one these logits predict)
+                const int next_pos = batch_view.pos[j] + 1;
+                if (next_pos >= slot.n_prompt_tokens) {
+                    continue; // last prompt token - its logits predict the first completion token
+                }
+
+                completion_token_output result;
+                result.tok          = slot.prompt_tokens[next_pos];
+                result.text_to_send = common_token_to_piece(ctx, result.tok, params_base.special);
+                result.prob         = 1.0f;
+                populate_token_probs(slot, result, false, params_base.special, j);
+                slot.prompt_token_probs.push_back(result);
             }
         }
 

@@ -61,6 +61,7 @@ struct slot_params {
 
     bool timings_per_token = false;
     bool post_sampling_probs = false;
+    bool prompt_logprobs     = false;
     json input_prefix;
     json input_suffix;
 
