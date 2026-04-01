@@ -72,6 +72,7 @@ struct server_slot {
     std::vector<int32_t> i_batch_dft;
 
     std::vector<completion_token_output> generated_token_probs;
+    std::vector<completion_token_output> prompt_token_probs;
     common_chat_msg chat_msg;
 
     bool infill = false;

@@ -188,29 +188,47 @@ size_t validate_utf8(const std::string& text) {
     size_t len = text.size();
     if (len == 0) return 0;
 
-    // Check the last few bytes to see if a multi-byte character is cut off
-    for (size_t i = 1; i <= 4 && i <= len; ++i) {
-        unsigned char c = text[len - i];
-        // Check for start of a multi-byte sequence from the end
-        if ((c & 0xE0) == 0xC0) {
-            // 2-byte character start: 110xxxxx
-            // Needs at least 2 bytes
-            if (i < 2) return len - i;
+    // Scan the entire string to find the last valid UTF-8 boundary.
+    // This handles both invalid bytes anywhere and truncated sequences at the end.
+    size_t valid_end = 0;
+    size_t i = 0;
+    while (i < len) {
+        unsigned char c = text[i];
+        size_t char_len = 0;
+        if ((c & 0x80) == 0x00) {
+            char_len = 1; // 0xxxxxxx - ASCII
+        } else if ((c & 0xE0) == 0xC0) {
+            char_len = 2; // 110xxxxx
+        } else if ((c & 0xF0) == 0xE0) {
+            char_len = 3; // 1110xxxx
+        } else if ((c & 0xF8) == 0xF0) {
+            char_len = 4; // 11110xxx
+        } else {
+            // Invalid start byte (e.g. 10xxxxxx continuation without start)
+            // Stop here — return up to the last valid character
+            return valid_end;
         }
-        else if ((c & 0xF0) == 0xE0) {
-            // 3-byte character start: 1110xxxx
-            // Needs at least 3 bytes
-            if (i < 3) return len - i;
+
+        // Check if we have enough bytes and all continuations are valid
+        if (i + char_len > len) {
+            return valid_end; // truncated sequence at end
         }
-        else if ((c & 0xF8) == 0xF0) {
-            // 4-byte character start: 11110xxx
-            // Needs at least 4 bytes
-            if (i < 4) return len - i;
+        bool valid = true;
+        for (size_t j = 1; j < char_len; j++) {
+            if ((text[i + j] & 0xC0) != 0x80) {
+                valid = false;
+                break;
+            }
         }
+        if (!valid) {
+            return valid_end;
+        }
+
+        i += char_len;
+        valid_end = i;
     }
 
-    // If no cut-off multi-byte character is found, return full length
-    return len;
+    return valid_end;
 }
 
 // TODO: reuse common_token_to_piece
