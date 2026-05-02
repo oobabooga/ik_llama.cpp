@@ -22,6 +22,51 @@ static void log_text(const gpt_params & params_base, const std::string & text) {
     }
 }
 
+void server_speculative_checkpoint::clear() {
+    valid = false;
+    per_step_enabled = false;
+    n_past = 0;
+    sampled = LLAMA_TOKEN_NULL;
+
+    if (sampler != nullptr) {
+        common_sampler_free(sampler);
+        sampler = nullptr;
+    }
+}
+
+static void discard_speculative_checkpoint(server_slot & slot, llama_context * ctx) {
+    slot.spec_ckpt.clear();
+    llama_spec_ckpt_discard(ctx);
+}
+
+static bool save_speculative_checkpoint(server_slot & slot, llama_model * model, llama_context * ctx, int ckpt_mode) {
+    slot.spec_ckpt.clear();
+    slot.spec_ckpt.n_past = slot.n_past - (int32_t)(slot.drafted.size() + 1);
+    slot.spec_ckpt.sampled = slot.sampled;
+
+    const int max_tokens = (int)slot.drafted.size() + 1;
+    const int actual_mode = llama_spec_ckpt_init(ctx, ckpt_mode, max_tokens);
+    if (actual_mode == LLAMA_SPEC_CKPT_NONE) {
+        return false;
+    }
+    slot.spec_ckpt.per_step_enabled = (actual_mode == LLAMA_SPEC_CKPT_PER_STEP);
+
+    slot.spec_ckpt.valid = llama_spec_ckpt_save(ctx, slot.id);
+    if (!slot.spec_ckpt.valid) {
+        llama_spec_ckpt_discard(ctx);
+        return false;
+    }
+
+    slot.spec_ckpt.sampler = common_sampler_init(model, slot.sparams);
+    if (slot.spec_ckpt.sampler == nullptr) {
+        discard_speculative_checkpoint(slot, ctx);
+        return false;
+    }
+
+    common_sampler_clone(slot.ctx_sampling, slot.spec_ckpt.sampler);
+    return true;
+}
+
 server_context::~server_context() {
     if (ctx) {
         llama_free(ctx);
@@ -49,6 +94,7 @@ server_context::~server_context() {
         if (slot.ctx_sampling != nullptr) {
             common_sampler_free(slot.ctx_sampling);
         }
+        slot.spec_ckpt.clear();
         if (slot.ctx_dft) {
             llama_free(slot.ctx_dft);
         }
@@ -112,15 +158,6 @@ bool server_context::load_model(const gpt_params& params_) {
     }
     // Load draft model for speculative decoding if specified
     if (has_draft_model) {
-
-        if (llama_model_has_recurrent(model)) {
-            LLAMA_LOG_WARN("\n=======================================================================\n");
-            LLAMA_LOG_WARN(" Speculative decodong is not suported for recurrent/hybrid models\n");
-            LLAMA_LOG_WARN(" --> bailing out\n");
-            LLAMA_LOG_WARN("========================================================================\n\n");
-            GGML_ABORT("Fatal error");
-        }
-
         LLAMA_LOG_INFO("\n\n==================================loading DRAFT model==================================\n\n");
 
         gpt_params params_dft;
@@ -387,6 +424,7 @@ void server_slot::reset() {
     n_sent_text = 0;
     drafted.clear();
     i_batch_dft.clear();
+    spec_ckpt.clear();
     n_sent_token_probs = 0;
     infill = false;
     ga_i = 0;
@@ -1584,7 +1622,13 @@ bool server_context::launch_slot_with_task(server_slot& slot, server_task& task)
         if (params_base.ctx_shift) {
             params_base.ctx_shift = false;
             LOG_WARNING("%s\n", "ctx_shift is not supported by recurrent model, it will be disabled");
+        }
     }
+    if (llama_model_is_split_mode_graph(llama_get_model(slot.ctx))) {
+        if (params_base.ctx_shift) {
+            params_base.ctx_shift = false;
+            LOG_WARNING("%s\n", "ctx_shift is not implemented for split mode graph, it will be disabled");
+        }
     }
     {
         const auto& stop = data.find("stop");
@@ -3178,10 +3222,10 @@ void  server_context::create_checkpoint_at_interval(server_slot & slot, const gp
         if (slot.checkpoint_pos + params_base.ctx_checkpoints_interval <= 1 + pos) {
             bool created = create_checkpoint(slot);
             if (created) {
-            slot.checkpoint_pos = pos;
+                slot.checkpoint_pos = pos;
+            }
         }
     }
-}
 }
 
 void server_context::apply_checkpoint(server_slot & slot) {
@@ -3198,8 +3242,7 @@ void server_context::apply_checkpoint(server_slot & slot) {
                 slot.server_cached_prompt.checkpoints.rbegin(),
                 slot.server_cached_prompt.checkpoints.rend(),
                 [&](const auto & cur) {
-                    // guarantee that a checkpoint will result in at least one token being processed [TAG_PROMPT_LOGITS]
-                    return cur.pos_min < pos_min_thold;
+                    return cur.pos_min < pos_min_thold || cur.pos_min == 0;
                 }
             );
 
@@ -3225,10 +3268,13 @@ void server_context::apply_checkpoint(server_slot & slot) {
             }
 
             if (do_reset) {
-                SLT_WRN(slot, "forcing full prompt re-processing due to lack of cache data (likely due to SWA or hybrid/recurrent memory, see %s)\n",
+                SLT_WRN(slot, "forcing full prompt re-processing due to lack of cache data (likely due to SWA, see %s)\n",
                     "https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055");
                 slot.n_past = 0;
                 slot.n_past_prompt = 0;
+                slot.n_past_se = 0;
+                slot.ga_i = 0;
+                common_sampler_reset(slot.ctx_sampling);
             }
         }
     }
@@ -3671,6 +3717,99 @@ void server_context::extend_context(const int32_t n_tokens) {
     }
 }
 
+// Restore recurrent state and re-decode accepted tokens after speculative-decode rejection.
+static void restore_speculative_checkpoint(
+        server_slot & slot, llama_context * ctx, llama_model * model,
+        const std::vector<llama_token> & ids, int n_draft,
+        const std::vector<float> & mtp_hidden_state_pre, int32_t mtp_n_past_base) {
+    if (slot.spec_ckpt.per_step_enabled) {
+        const int step = (int)ids.size() - 1;
+        llama_spec_ckpt_restore(ctx, slot.id, slot.spec_ckpt.n_past, step);
+
+        if (slot.spec_ckpt.sampler) {
+            common_sampler_clone(slot.spec_ckpt.sampler, slot.ctx_sampling);
+        }
+        for (llama_token id : ids) {
+            common_sampler_accept(slot.ctx_sampling, ctx, id, true);
+        }
+
+        // Update MTP KV cache and hidden state using embeddings collected before checkpoint restore.
+        if (slot.has_mtp && !mtp_hidden_state_pre.empty()) {
+            slot.mtp_hidden_state = mtp_hidden_state_pre;
+            llama_context * mtp_ctx = common_speculative_get_mtp_ctx(slot.spec);
+            llama_context * mtp_target = mtp_ctx ? mtp_ctx : ctx;
+            llama_set_draft_input_hidden_state(mtp_target, slot.mtp_hidden_state.data());
+            mtp_accept_tokens(mtp_target, ids, mtp_n_past_base, slot.id);
+        }
+
+        SLT_DBG(slot, "per-step restore: step=%d (rejected %d drafts)\n",
+            step, (int)(n_draft - (ids.size() - 1)));
+    } else {
+        // Restore pre-speculation recurrent state then re-decode accepted tokens.
+        llama_spec_ckpt_restore(ctx, slot.id, slot.spec_ckpt.n_past, 0);
+
+        if (slot.spec_ckpt.sampler) {
+            common_sampler_clone(slot.spec_ckpt.sampler, slot.ctx_sampling);
+        }
+
+        if (!ids.empty()) {
+            // Re-decode to advance recurrent state to the accepted position.
+            const int n_re = (int)ids.size();
+            llama_batch re_batch = llama_batch_init(n_re, 0, 1);
+            common_batch_add(re_batch, slot.spec_ckpt.sampled, slot.spec_ckpt.n_past, { slot.id }, n_re == 1);
+            for (int j = 0; j < n_re - 1; j++) {
+                common_batch_add(re_batch, ids[j], slot.spec_ckpt.n_past + 1 + j, { slot.id }, j == n_re - 2);
+            }
+
+            if (slot.has_mtp) {
+                for (int j = 0; j < re_batch.n_tokens; j++) {
+                    re_batch.logits[j] = true;
+                }
+                llama_set_embeddings(ctx, true);
+            }
+
+            const int ret = llama_decode(ctx, re_batch);
+            if (ret != 0) {
+                SLT_ERR(slot, "failed to re-decode accepted tokens after checkpoint restore: %d\n", ret);
+            }
+            if (slot.has_mtp) {
+                const int n_embd = llama_model_n_embd(llama_get_model(ctx));
+
+                const int n_accepted = (int)ids.size();
+                slot.mtp_hidden_state.resize(n_accepted * n_embd);
+                for (int j = 0; j < n_accepted; j++) {
+                    const float * emb_j = llama_get_embeddings_ith(ctx, j);
+                    if (emb_j) {
+                        memcpy(slot.mtp_hidden_state.data() + j * n_embd, emb_j, n_embd * sizeof(float));
+                    }
+                }
+
+                llama_context * mtp_ctx_rej = common_speculative_get_mtp_ctx(slot.spec);
+                llama_context * mtp_target_rej = mtp_ctx_rej ? mtp_ctx_rej : ctx;
+                llama_set_draft_input_hidden_state(mtp_target_rej, slot.mtp_hidden_state.data());
+                mtp_accept_tokens(mtp_target_rej, ids, slot.spec_ckpt.n_past, slot.id);
+
+                if (n_accepted > 1) {
+                    memmove(slot.mtp_hidden_state.data(),
+                            slot.mtp_hidden_state.data() + (n_accepted - 1) * n_embd,
+                            n_embd * sizeof(float));
+                }
+                slot.mtp_hidden_state.resize(n_embd);
+            }
+
+            for (llama_token id : ids) {
+                common_sampler_accept(slot.ctx_sampling, ctx, id, true);
+            }
+
+            llama_batch_free(re_batch);
+            SLT_DBG(slot, "spec checkpoint restored: re-decoded %d tokens (rejected %d drafts)\n",
+                n_re, (int)(n_draft - (ids.size() - 1)));
+        }
+    }
+
+    discard_speculative_checkpoint(slot, ctx);
+}
+
 void server_context::speculative_decoding_accept() {
     for (auto& slot : slots) {
         if (slot.state != SLOT_STATE_PROCESSING || slot.i_batch_dft.empty()) {
@@ -3683,30 +3822,28 @@ void server_context::speculative_decoding_accept() {
 
         // the accepted tokens from the speculation
         const auto ids = common_sampler_sample_and_accept_n(slot.ctx_sampling, ctx, slot.i_batch_dft, slot.drafted);
-        
+
+        int32_t mtp_n_past_base = 0;
+        std::vector<float> mtp_hidden_state_pre;
         if (slot.has_mtp) {
-            llama_context * mtp_ctx = common_speculative_get_mtp_ctx(slot.spec);
-            llama_context * mtp_target = mtp_ctx ? mtp_ctx : ctx;
+            mtp_n_past_base = slot.n_past - (slot.drafted.size() + 1);
 
             const int n_embd = llama_model_n_embd(llama_get_model(ctx));
             if (!ids.empty()) {
-                const float* emb = llama_get_embeddings(ctx);
-                if (emb) {
-                    slot.mtp_hidden_state.resize(ids.size() * n_embd);
-                    memcpy(slot.mtp_hidden_state.data(), emb, ids.size() * n_embd * sizeof(float));
+                mtp_hidden_state_pre.resize(ids.size() * n_embd);
+                for (size_t i = 0; i < ids.size(); i++) {
+                    const float* emb_i = llama_get_embeddings_ith(ctx, slot.i_batch_dft[i]);
+                    if (emb_i) {
+                        memcpy(mtp_hidden_state_pre.data() + i * n_embd, emb_i, n_embd * sizeof(float));
+                    }
                 }
             } else {
                 const float* emb0 = llama_get_embeddings_ith(ctx, 0);
                 if (emb0) {
-                    slot.mtp_hidden_state.resize(n_embd);
-                    memcpy(slot.mtp_hidden_state.data(), emb0, n_embd * sizeof(float));
+                    mtp_hidden_state_pre.resize(n_embd);
+                    memcpy(mtp_hidden_state_pre.data(), emb0, n_embd * sizeof(float));
                 }
             }
-            
-            llama_set_draft_input_hidden_state(mtp_target, slot.mtp_hidden_state.data());
-
-            int32_t n_past_base = slot.n_past - (slot.drafted.size() + 1);
-            mtp_accept_tokens(mtp_target, ids, n_past_base, slot.id);
         }
 
         slot.i_batch_dft.clear();
@@ -3731,7 +3868,22 @@ void server_context::speculative_decoding_accept() {
         slot.sampled = ids.back(); // last accepted token
         slot.n_past = slot.cache_tokens.n_tokens();
 
-        llama_kv_cache_seq_rm(ctx, slot.id, slot.n_past, -1);
+        // for recurrent/hybrid models: if any drafts were rejected, restore recurrent state
+        const bool any_rejected = (ids.size() - 1) < n_draft;
+        if (any_rejected && slot.spec_ckpt.valid) {
+            restore_speculative_checkpoint(slot, ctx, model, ids, n_draft, mtp_hidden_state_pre, mtp_n_past_base);
+        } else {
+            if (slot.has_mtp && !mtp_hidden_state_pre.empty()) {
+                    llama_context * mtp_ctx = common_speculative_get_mtp_ctx(slot.spec);
+                    llama_context * mtp_target = mtp_ctx ? mtp_ctx : ctx;
+
+                    slot.mtp_hidden_state = std::move(mtp_hidden_state_pre);
+                    llama_set_draft_input_hidden_state(mtp_target, slot.mtp_hidden_state.data());
+                    mtp_accept_tokens(mtp_target, ids, mtp_n_past_base, slot.id);
+                }
+            llama_kv_cache_seq_rm(ctx, slot.id, slot.n_past, -1);
+            discard_speculative_checkpoint(slot, ctx);
+        }
 
         for (size_t i = 0; i < ids.size(); ++i) {
             completion_token_output result;
@@ -3747,10 +3899,6 @@ void server_context::speculative_decoding_accept() {
             if (slot.n_buffer == 0 || !params_base.can_ban_phrases) {
                 if (!process_token(result, slot)) {
                     // release slot because of stop condition
-                    slot.i_batch_dft.push_back(batch.n_tokens);
-                    common_batch_add(batch, slot.sampled, slot.cache_tokens.pos_next(), { slot.id }, true);
-                    slot.cache_tokens.push_back(slot.sampled);
-                    slot.n_past++;
                     send_final_response(slot);
                     release_slot_after_final_response(slot);
                     break;
@@ -3808,10 +3956,6 @@ void server_context::send_token_results(completion_token_outputs& results, serve
             if (slot.stopped_limit && !slot.stopped_eos && !slot.stopped_word) {
                 continue;
             }
-            slot.i_batch = batch.n_tokens;
-            common_batch_add(batch, slot.sampled, slot.cache_tokens.pos_next(), { slot.id }, true);
-            slot.cache_tokens.push_back(slot.sampled);
-            slot.n_past++;
             send_final_response(slot);
             release_slot_after_final_response(slot);
             released = true;
@@ -3823,10 +3967,6 @@ void server_context::send_token_results(completion_token_outputs& results, serve
     }
 
     if (!released && slot.stopped_limit && !slot.stopped_eos && !slot.stopped_word) {
-        slot.i_batch = batch.n_tokens;
-        common_batch_add(batch, slot.sampled, slot.cache_tokens.pos_next(), { slot.id }, true);
-        slot.cache_tokens.push_back(slot.sampled);
-        slot.n_past++;
         send_final_response(slot);
         release_slot_after_final_response(slot);
     }
@@ -4125,12 +4265,14 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
                 }
             }
             if (mtp_warmup_needed) {
-                const float* emb = llama_get_embeddings(ctx); 
                 const int n_embd = llama_model_n_embd(llama_get_model(ctx)); 
                 const int n_toks = batch_view.n_tokens;
-                if (emb) {
-                    batch_mtp_hidden_state.resize(n_toks * n_embd);
-                    memcpy(batch_mtp_hidden_state.data(), emb, n_toks * n_embd * sizeof(float));
+                batch_mtp_hidden_state.resize(n_toks * n_embd);
+                for (int t = 0; t < n_toks; t++) {
+                    const float* emb_t = llama_get_embeddings_ith(ctx, t);
+                    if (emb_t) {
+                        memcpy(batch_mtp_hidden_state.data() + t * n_embd, emb_t, n_embd * sizeof(float));
+                    }
                 }
             }
         }
@@ -4312,7 +4454,7 @@ void server_context::update_slots() {
     // apply context-shift if needed
     // TODO: simplify and improve
     context_shift();
-    
+
     // start populating the batch for this iteration
     common_batch_clear(batch);
 
@@ -4342,6 +4484,23 @@ void server_context::update_slots() {
 
     // make sure we're in the right embedding mode
     llama_set_embeddings(ctx, batch_type == 1);
+
+    if (llama_model_has_recurrent(model)) {
+        const int ckpt_mode = params_base.speculative.recurrent_ckpt_mode;
+
+        for (auto & slot : slots) {
+            if (slot.state != SLOT_STATE_PROCESSING || slot.i_batch_dft.empty()) {
+                continue;
+            }
+            if (save_speculative_checkpoint(slot, model, ctx, ckpt_mode)) {
+                const char * mode_name = slot.spec_ckpt.per_step_enabled ? "per-step" : "shadow/cpu";
+                SLT_DBG(slot, "spec checkpoint saved (mode=%s), n_past_pre_spec=%d\n",
+                    mode_name, slot.spec_ckpt.n_past);
+            } else {
+                SLT_WRN(slot, "%s", "failed to save spec checkpoint\n");
+            }
+        }
+    }
 
     // process the created batch of tokens
     process_batch_tokens(n_batch); // Decode with batch

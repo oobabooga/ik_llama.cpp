@@ -598,6 +598,7 @@ struct common_speculative_state_ngram_mod : public common_speculative_state {
         i_last = 0;
 
         n_draft_last = 0;
+        n_low = 0;
 
         const size_t n = mod.get_n();
 
@@ -692,6 +693,7 @@ struct common_speculative_state_ngram_mod : public common_speculative_state {
 
                     mod.reset();
                     n_low = 0;
+                    i_last = 0;
                 }
             } else {
                 n_low = 0;
@@ -1265,13 +1267,11 @@ void common_speculative_accept(common_speculative * spec, uint16_t n_accepted) {
         spec->t_step_start_us = 0;
     }
 
-    if (n_accepted == 0) {
-        return;
-    }
-
     common_speculative_state * impl = spec->curr_impl;
 
-    GGML_ASSERT(impl);
+    if (!impl) {
+        return;
+    }
 
     {
         common_time_meas tm(impl->t_accept_us, !impl->gen_perf);
@@ -1374,6 +1374,8 @@ std::vector<llama_token> mtp_speculative_gen_draft(
 
     llama_token current_input_id = id_last;
     int32_t current_n_past = n_past;
+    const int n_embd = llama_model_n_embd(llama_get_model(ctx));
+    std::vector<float> draft_hidden_state(n_embd);
 
     for (int i = 0; i < n_draft; ++i) {
         mtp_batch.n_tokens = 0;
@@ -1389,9 +1391,13 @@ std::vector<llama_token> mtp_speculative_gen_draft(
         drafts.push_back(id_next);
 
         const float * emb = llama_get_embeddings_ith(ctx, 0);
-        if (emb) {
-            llama_set_draft_input_hidden_state(ctx, emb);
+        if (!emb) {
+            break;
         }
+        
+        // Keep a stable copy because later decode steps reuse ctx->embd storage.
+        memcpy(draft_hidden_state.data(), emb, n_embd * sizeof(float));
+        llama_set_draft_input_hidden_state(ctx, draft_hidden_state.data());
 
         current_input_id = id_next;
         current_n_past++;

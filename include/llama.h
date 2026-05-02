@@ -505,6 +505,7 @@ extern "C" {
     };
 
     // model quantization parameters
+    struct quantize_user_data;
     typedef struct llama_model_quantize_params {
         int32_t nthread;                     // number of threads to use for quantizing, if <=0 will use std::thread::hardware_concurrency()
         enum llama_ftype ftype;              // quantize to this llama_ftype
@@ -532,6 +533,7 @@ extern "C" {
         void * kv_overrides;                 // pointer to vector containing overrides
         void * custom_quants;                // pointer to vector containing custom quantization rules
         void * repack_pattern;               // pointer to a vector containing regexes to be used for matching tensor names. Can be null
+        struct quantize_user_data * user_data; // so we can pass extra data to the quantization functions
     } llama_model_quantize_params;
 
     // grammar types
@@ -683,6 +685,8 @@ extern "C" {
 
     LLAMA_API bool llama_model_has_recurrent(const struct llama_model * model);
 
+    LLAMA_API bool llama_model_is_split_mode_graph(const struct llama_model * model);
+
     // Returns 0 on success
     LLAMA_API uint32_t llama_model_quantize(
             const char * fname_inp,
@@ -797,6 +801,28 @@ extern "C" {
     // Clear the KV cache - both cell info is erased and KV data is zeroed
     LLAMA_API void llama_kv_cache_clear(
             struct llama_context * ctx);
+
+    // Unified checkpoint API for recurrent/hybrid speculative decoding.
+    enum llama_spec_ckpt_mode {
+        LLAMA_SPEC_CKPT_NONE        = -1,
+        LLAMA_SPEC_CKPT_AUTO        =  0,
+        LLAMA_SPEC_CKPT_PER_STEP    =  1,
+        LLAMA_SPEC_CKPT_GPU_FALLBACK =  2,
+        LLAMA_SPEC_CKPT_CPU         =  3,
+    };
+
+    // Initialise the checkpoint system for the upcoming speculation window.
+    LLAMA_API int llama_spec_ckpt_init(struct llama_context * ctx, int mode, int max_tokens);
+
+    // Save the current recurrent state as a speculative checkpoint.
+    LLAMA_API bool llama_spec_ckpt_save(struct llama_context * ctx, llama_seq_id seq_id);
+
+    // Restore the recurrent state after speculative decode.
+    LLAMA_API bool llama_spec_ckpt_restore(struct llama_context * ctx, llama_seq_id seq_id,
+                                            llama_pos n_past, int accepted_step);
+
+    // Discard the saved checkpoint and reset internal mode state.
+    LLAMA_API void llama_spec_ckpt_discard(struct llama_context * ctx);
 
     // Removes all tokens that belong to the specified sequence and have positions in [p0, p1)
     // Returns false if a partial sequence cannot be removed. Removing a whole sequence never fails
