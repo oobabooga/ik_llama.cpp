@@ -354,6 +354,8 @@ struct server_prompt_checkpoint {
     llama_pos pos_min_prompt;
     llama_pos pos_max_prompt;
 
+    int64_t n_tokens;
+
     std::vector<uint8_t> data;
 
     size_t size() const {
@@ -366,6 +368,7 @@ struct server_prompt_checkpoint {
         j["pos_max"] = pos_max;
         j["pos_min_prompt"] = pos_min_prompt;
         j["pos_max_prompt"] = pos_max_prompt;
+        j["n_tokens"] = n_tokens;
         return j;
     }
 
@@ -374,6 +377,7 @@ struct server_prompt_checkpoint {
         pos_max = j.value<llama_pos>("pos_max", 0);
         pos_min_prompt = j.value<llama_pos>("pos_min_prompt", 0);
         pos_max_prompt = j.value<llama_pos>("pos_max_prompt", 0);
+        n_tokens = j.value<int64_t>("n_tokens", 0);
     }
 };
 
