@@ -5818,6 +5818,7 @@ struct llama_model_quantize_params llama_model_quantize_default_params() {
         /*.ffn_down_type               =*/ GGML_TYPE_COUNT,
         /*.ffn_up_type                 =*/ GGML_TYPE_COUNT,
         /*.ffn_gat_inp_type            =*/ GGML_TYPE_COUNT,
+        /*.extra_output_type           =*/ GGML_TYPE_COUNT,
         /*.allow_requantize            =*/ false,
         /*.quantize_output_tensor      =*/ true,
         /*.only_copy                   =*/ false,
@@ -6012,6 +6013,9 @@ void llama_free_model(struct llama_model * model) {
 }
 
 static void llama_repack_up_gate_exps(llama_context & lctx) {
+    if (lctx.cparams.mtp_op_type != MTP_OP_NONE) {
+        return;
+    }
     auto & model = lctx.model;
     bool needs_repack = false;
     for (auto & l : model.layers) {
