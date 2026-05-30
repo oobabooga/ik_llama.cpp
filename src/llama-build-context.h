@@ -265,7 +265,8 @@ struct llm_build_context {
             ggml_tensor * rope_cache,
             float kq_scale, float attn_factor_scaled,
             bool use_f32_attn_precision,
-            bool is_lite);
+            bool is_lite,
+            bool pp_opt);
 
     ggml_tensor * build_deepseek2_layer_attention(
             ggml_cgraph * gf, int il,
@@ -485,6 +486,14 @@ llm_expert_gating_func_type   gating_op,
         struct ggml_tensor * rope_cache
     );
 
+    struct ggml_tensor * build_deepseek2_mtp(
+        const struct llama_layer & mtp_layer,
+        struct ggml_tensor * prev_embeddings,
+        struct ggml_cgraph * gf,
+        struct ggml_tensor * inp_pos,
+        struct ggml_tensor * rope_cache
+    );
+
     struct ggml_tensor * build_qwen35_mtp(
         const struct llama_layer & mtp_layer,
         struct ggml_tensor * prev_embeddings,
@@ -500,4 +509,6 @@ llm_expert_gating_func_type   gating_op,
         struct ggml_cgraph * gf,
         struct ggml_tensor * inp_pos
     );
+
+    ggml_cgraph * new_graph_custom();
 };

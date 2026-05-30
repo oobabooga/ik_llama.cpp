@@ -177,6 +177,9 @@ struct llama_layer {
     struct ggml_tensor * wkq_a_mqa = nullptr;
     struct ggml_tensor * wkv_b = nullptr;
     struct ggml_tensor * wk_b = nullptr;
+    // wk_b in pp_opt-favoring layout [kv_lora_rank, qk_nope, n_head], serialized
+    // as "attn_kv_b.weight". Materialized under -sm graph + mla>1; mla=1 skips.
+    struct ggml_tensor * wk_b_pp = nullptr;
     struct ggml_tensor * wv_b = nullptr;
     struct ggml_tensor * wq_cross = nullptr;
     struct ggml_tensor * wk_cross = nullptr;
@@ -224,6 +227,7 @@ struct llama_layer {
     llama_split_tensor split_wq_b;
     llama_split_tensor split_wkv_a_mqa;
     llama_split_tensor split_wk_b;
+    llama_split_tensor split_wk_b_pp;
     llama_split_tensor split_wv_b;
     llama_split_tensor split_attn_q_a_norm;
     llama_split_tensor split_attn_kv_a_norm;
@@ -381,11 +385,13 @@ struct llama_layer {
     struct llama_layer_nextn nextn;
 
     std::unique_ptr<ggml_tensor> computed_wk_b;
+    std::unique_ptr<ggml_tensor> computed_wk_b_pp;
     std::unique_ptr<ggml_tensor> computed_wv_b;
     std::unique_ptr<ggml_tensor> computed_wkv_b;
 
     // Per-device replicas of computed wk_b/wv_b (-sm graph). Buffers owned via model.bufs.
     std::vector<std::unique_ptr<ggml_tensor>> computed_wk_b_replicas;
+    std::vector<std::unique_ptr<ggml_tensor>> computed_wk_b_pp_replicas;
     std::vector<std::unique_ptr<ggml_tensor>> computed_wv_b_replicas;
 };
 
@@ -490,6 +496,9 @@ struct llama_model {
 
     bool tensor_overrides;
 
+    // Set by llm_apply_khad_pretransform once H is folded into wv_b/wk_b_pp.
+    bool khad_pretransformed = false;
+
     ~llama_model();
 
     size_t max_nodes(int n_tokens) const {
@@ -504,6 +513,30 @@ struct llama_model {
 
     bool has_tensor_overrides() const {
         return tensor_overrides;
+    }
+
+    bool is_mla_model() const {
+        return arch == LLM_ARCH_DEEPSEEK2 || arch == LLM_ARCH_GLM_DSA || arch == LLM_ARCH_MISTRAL4;
+    }
+
+    static inline int hadamard_size(int head_size) {
+        if ((head_size & ~(head_size - 1)) == head_size) return head_size;
+        // Note: we do not include 32 as an option because the CUDA Hadamard implementation
+        //       does not hcurrently andle a block size of 32.
+        for (int i = 512; i >= 64; i >>= 1) {
+            if (head_size % i == 0) return i;
+        }
+        return 0;
+    }
+
+    inline int hadamard_size_k(int il) const {
+        if (is_mla_model()) return 64;
+        return hadamard_size(hparams.n_embd_head_k(il));
+    }
+
+    inline int hadamard_size_v(int il) const {
+        if (is_mla_model()) return 64;
+        return hadamard_size(hparams.n_embd_head_v(il));
     }
 
     size_t cache_size(int il, ggml_type type_k, ggml_type type_v, uint32_t kv_size, int mla_attn, int n_seq_max, bool flash_attn) const;
